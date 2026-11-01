@@ -8,13 +8,14 @@ PROGRAM = os.getenv('SOLANA_PROGRAM_ID', '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFS
 WS_URL = os.getenv('SOLANA_WS_URL', 'wss://api.mainnet-beta.solana.com/')
 HTTP_URL = os.getenv('SOLANA_HTTP_URL', 'https://api.mainnet-beta.solana.com')
 MAX_RPM = max(1, min(60, int(os.getenv('RPC_MAX_RPM', '12'))))
+MAX_TX_VERSION = max(1, int(os.getenv('MAX_SUPPORTED_TX_VERSION', '1')))
 SAMPLE_EVERY = max(1, int(os.getenv('SAMPLE_EVERY', '250'))) # bounded RPC sampling
 QUEUE = queue.Queue(maxsize=250)
 LOCK = threading.Lock()
 STATE = dict(connected=False, subscription_id=None, last_event=None, last_error=None, events=0,
              candidates=0, decoded=0, rpc_errors=0, dropped=0, filtered=0,
              failed_transactions=0, init_markers=0, duplicates=0, rpc_null=0,
-             sampled=0, verified_inits=0, non_init_decoded=0,
+             sampled=0, verified_inits=0, non_init_decoded=0, version_errors=0,
              last_candidate=None, mode='research_only', live_trading=False)
 CANDIDATES = collections.deque(maxlen=30)
 SEEN = collections.deque(maxlen=1000)
@@ -87,8 +88,8 @@ def stream():
 
 def rpc(sig):
     payload=json.dumps({'jsonrpc':'2.0','id':1,'method':'getTransaction',
-      'params':[sig,{'encoding':'jsonParsed','commitment':'confirmed','maxSupportedTransactionVersion':0}]}).encode()
-    req=urllib.request.Request(HTTP_URL,data=payload,headers={'Content-Type':'application/json','User-Agent':'solana-research-v04'})
+      'params':[sig,{'encoding':'jsonParsed','commitment':'confirmed','maxSupportedTransactionVersion':MAX_TX_VERSION}]}).encode()
+    req=urllib.request.Request(HTTP_URL,data=payload,headers={'Content-Type':'application/json','User-Agent':'solana-research-v08'})
     with urllib.request.urlopen(req,timeout=18) as res: answer=json.load(res)
     if 'error' in answer: raise RuntimeError(str(answer['error'])[:220])
     return answer.get('result')
@@ -140,7 +141,7 @@ def heartbeat():
     while True:
         time.sleep(60)
         with LOCK:
-            snapshot = {k:STATE[k] for k in ('connected','events','failed_transactions','filtered','init_markers','sampled','candidates','decoded','verified_inits','non_init_decoded','rpc_errors','rpc_null','dropped')}
+            snapshot = {k:STATE[k] for k in ('connected','events','failed_transactions','filtered','init_markers','sampled','candidates','decoded','verified_inits','non_init_decoded','rpc_errors','version_errors','rpc_null','dropped')}
         emit('heartbeat',**snapshot)
 
 def decoder():
@@ -165,7 +166,9 @@ def decoder():
                 bump('rpc_null')
                 emit('candidate_unavailable',signature=sig)
         except (urllib.error.HTTPError,urllib.error.URLError,TimeoutError,RuntimeError,ValueError) as exc:
-            bump('rpc_errors'); emit('rpc_error',signature=sig,error=str(exc)[:180])
+            bump('rpc_errors')
+            if '-32015' in str(exc): bump('version_errors')
+            emit('rpc_error',signature=sig,error=str(exc)[:180])
             if isinstance(exc,urllib.error.HTTPError) and exc.code==429:
                 next_call=time.monotonic()+max(30,spacing*3)
         except Exception as exc:
@@ -179,11 +182,11 @@ class Handler(BaseHTTPRequestHandler):
             data = dict(STATE)
             data['queue_depth'] = QUEUE.qsize()
             if path == '/candidates':
-                data = {'version':'v0.7','mode':'research_only','candidates':list(CANDIDATES)}
+                data = {'version':'v0.8','mode':'research_only','candidates':list(CANDIDATES)}
             else:
-                data['version'] = 'v0.7'
+                data['version'] = 'v0.8'
         if path not in ('/','/health','/candidates'):
-            data = {'version':'v0.7','error':'not_found','requested_path':path,
+            data = {'version':'v0.8','error':'not_found','requested_path':path,
                     'available_paths':['/','/health','/candidates']}
             code = 404
         else:
@@ -191,16 +194,16 @@ class Handler(BaseHTTPRequestHandler):
         raw=json.dumps(data,default=str).encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type','application/json; charset=utf-8')
-        self.send_header('X-Scanner-Version','v0.7')
+        self.send_header('X-Scanner-Version','v0.8')
         self.send_header('Cache-Control','no-store')
         self.send_header('Content-Length',str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
-        emit('http_request',path=path,status=code,version='v0.7')
+        emit('http_request',path=path,status=code,version='v0.8')
     def log_message(self,*args): pass
 
 if __name__=='__main__':
-    emit('starting',version='v0.7',program=PROGRAM,rpc_max_rpm=MAX_RPM,sample_every=SAMPLE_EVERY,mode='research_only',port=int(os.getenv('PORT','10000')))
+    emit('starting',version='v0.8',program=PROGRAM,rpc_max_rpm=MAX_RPM,sample_every=SAMPLE_EVERY,max_supported_tx_version=MAX_TX_VERSION,mode='research_only',port=int(os.getenv('PORT','10000')))
     threading.Thread(target=stream,daemon=True).start()
     threading.Thread(target=decoder,daemon=True).start()
     threading.Thread(target=heartbeat,daemon=True).start()

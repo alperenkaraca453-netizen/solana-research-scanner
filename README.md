@@ -1,9 +1,5 @@
-# Solana scanner v0.7 — instruction verification
+# Solana Scanner v0.8
 
-Research only, no trading. Corrects the v0.6 escaped regex bug.
+Fixes Solana RPC error -32015 for transaction version 1 by setting `maxSupportedTransactionVersion` to 1. Adds `version_errors` diagnostics. Set `MAX_SUPPORTED_TX_VERSION` environment variable if future network transactions require a higher version. Research only; live trading disabled.
 
-Samples one in every SAMPLE_EVERY (default 250) successful notifications even without a matching log, then decodes Raydium AMM v4 instructions via getTransaction. Discriminator 1 is Initialize2.
-
-`/health`: sampled, decoded, verified_inits, non_init_decoded, init_markers, rpc_errors. `/candidates`: **verified** AMM v4 pool-init instructions only.
-
-Default RPC_MAX_RPM=12, SAMPLE_EVERY=250. Monitoring only Raydium AMM v4; does not include CPMM, CLMM or PumpSwap.
+Upload `main.py` to repository root and deploy latest commit on Render. Check `/health` for version v0.8, decoded, rpc_errors, version_errors, verified_inits.
