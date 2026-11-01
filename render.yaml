@@ -1,0 +1,12 @@
+services:
+  - type: worker
+    name: solana-research-scanner
+    runtime: docker
+    plan: starter
+    envVars:
+      - key: POLL_SECONDS
+        value: '120'
+      - key: MIN_LIQ_USD
+        value: '50000'
+      - key: MIN_VOL_H1_USD
+        value: '20000'
