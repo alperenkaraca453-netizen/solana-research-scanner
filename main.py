@@ -1,65 +1,142 @@
-"""Solana event stream monitor: research only, never submits transactions."""
-import json, os, threading, time, datetime, urllib.request
+"""Raydium AMM v4 pool-init research monitor. No orders, keys, or trading."""
+import collections, datetime, json, os, queue, threading, time, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from websocket import create_connection, WebSocketTimeoutException
+from websocket import create_connection
 
-RPC_WS = os.getenv('SOLANA_WS_URL', 'wss://api.mainnet-beta.solana.com/')
-# Raydium AMM v4; logs are transaction events, NOT verified pool launches.
-PROGRAM = os.getenv('SOLANA_PROGRAM_ID', '675kPX9MHTjS2zt1qfr1NYHuze1uFQd1f4Gd5Kp9a')
-STATE = {'connected': False, 'last_event': None, 'events': 0, 'last_error': None, 'mode': 'research_only'}
+PROGRAM = os.getenv('SOLANA_PROGRAM_ID', '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8')
+WS_URL = os.getenv('SOLANA_WS_URL', 'wss://api.mainnet-beta.solana.com/')
+HTTP_URL = os.getenv('SOLANA_HTTP_URL', 'https://api.mainnet-beta.solana.com')
+MAX_RPM = max(1, min(60, int(os.getenv('RPC_MAX_RPM', '12'))))
+QUEUE = queue.Queue(maxsize=250)
 LOCK = threading.Lock()
+STATE = dict(connected=False, subscription_id=None, last_event=None, last_error=None, events=0,
+             candidates=0, decoded=0, rpc_errors=0, dropped=0, filtered=0,
+             last_candidate=None, mode='research_only', live_trading=False)
+CANDIDATES = collections.deque(maxlen=30)
+SEEN = collections.deque(maxlen=1000)
+SEEN_SET = set()
 
-def utc():
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
+def emit(event, **kwargs): print(json.dumps({'ts':now(),'event':event,**kwargs}, default=str), flush=True)
+def update(**kwargs):
+    with LOCK: STATE.update(kwargs)
+def bump(key):
+    with LOCK: STATE[key] += 1
 
-def listen():
-    retry = 2
+def enqueue(value):
+    sig = value.get('signature')
+    if not sig or value.get('err') is not None: return
+    logs = value.get('logs') or []
+    # Raydium AMM v4 initializes a pool using initialize2. Only this pattern is
+    # queued for transaction verification; arbitrary swaps are NOT pool launches.
+    if not any('initialize2' in str(line).lower() or 'initialize_2' in str(line).lower() for line in logs):
+        bump('filtered'); return
+    if sig in SEEN_SET: return
+    if len(SEEN) == SEEN.maxlen: SEEN_SET.discard(SEEN.popleft())
+    SEEN.append(sig); SEEN_SET.add(sig)
+    try: QUEUE.put_nowait(sig); bump('candidates'); emit('candidate_queued', signature=sig)
+    except queue.Full: bump('dropped'); emit('queue_full', signature=sig)
+
+def stream():
+    delay=2
     while True:
-        ws = None
+        ws=None
         try:
-            ws = create_connection(RPC_WS, timeout=30)
-            ws.settimeout(45)
+            ws=create_connection(WS_URL, timeout=25); ws.settimeout(50)
             ws.send(json.dumps({'jsonrpc':'2.0','id':1,'method':'logsSubscribe','params':[{'mentions':[PROGRAM]},{'commitment':'confirmed'}]}))
-            ack = json.loads(ws.recv())
-            if 'result' not in ack:
-                raise RuntimeError(f'subscription rejected: {str(ack)[:350]}')
-            with LOCK:
-                STATE.update(connected=True, last_error=None)
-            retry = 2
+            ack=json.loads(ws.recv())
+            if not isinstance(ack.get('result'),int): raise RuntimeError('subscription rejected: '+str(ack)[:250])
+            update(connected=True,subscription_id=ack['result'],last_error=None)
+            emit('subscribed',program=PROGRAM,subscription=ack['result'])
+            delay=2
             while True:
-                msg = json.loads(ws.recv())
-                if msg.get('method') != 'logsNotification':
-                    continue
-                value = msg.get('params',{}).get('result',{}).get('value',{})
+                msg=json.loads(ws.recv())
+                if msg.get('method') != 'logsNotification': continue
+                value=msg.get('params',{}).get('result',{}).get('value',{})
                 with LOCK:
-                    STATE['events'] += 1
-                    STATE['last_event'] = utc()
-                # Emit signature only. No false claim that every event is a new token.
-                print(json.dumps({'ts':utc(),'event':'program_transaction','signature':value.get('signature'),'err':value.get('err')}),flush=True)
+                    STATE['events']+=1; STATE['last_event']=now()
+                enqueue(value)
         except Exception as exc:
-            with LOCK:
-                STATE.update(connected=False,last_error=str(exc))
-            print('stream_error',str(exc),flush=True)
-            time.sleep(retry)
-            retry = min(60,retry*2)
+            update(connected=False,subscription_id=None,last_error=str(exc))
+            emit('stream_error',error=str(exc)); time.sleep(delay); delay=min(60,delay*2)
         finally:
             if ws:
                 try: ws.close()
                 except Exception: pass
 
+def rpc(sig):
+    payload=json.dumps({'jsonrpc':'2.0','id':1,'method':'getTransaction',
+      'params':[sig,{'encoding':'jsonParsed','commitment':'confirmed','maxSupportedTransactionVersion':0}]}).encode()
+    req=urllib.request.Request(HTTP_URL,data=payload,headers={'Content-Type':'application/json','User-Agent':'solana-research-v04'})
+    with urllib.request.urlopen(req,timeout=18) as res: answer=json.load(res)
+    if 'error' in answer: raise RuntimeError(str(answer['error'])[:220])
+    return answer.get('result')
+
+def extract(sig,tx):
+    if not tx or tx.get('meta',{}).get('err') is not None: return None
+    msg=tx.get('transaction',{}).get('message',{})
+    keys=msg.get('accountKeys',[])
+    accounts=[k.get('pubkey') if isinstance(k,dict) else k for k in keys]
+    # Parsed inner instructions may contain initialize2; do not infer that every
+    # transaction mentioning Raydium is a new liquidity pool.
+    instructions=list(msg.get('instructions',[]))
+    for group in tx.get('meta',{}).get('innerInstructions',[]) or []:
+        instructions.extend(group.get('instructions',[]))
+    matched=[]
+    for ins in instructions:
+        program_id=ins.get('programId')
+        parsed=ins.get('parsed',{})
+        typ=parsed.get('type','') if isinstance(parsed,dict) else ''
+        if program_id==PROGRAM and typ.lower() in ('initialize2','initialize_2','initialize'):
+            matched.append(typ)
+    # If RPC does not expose parsed Raydium instruction, record candidate as
+    # unverified rather than claiming pool/token discovery.
+    balances=tx.get('meta',{}).get('postTokenBalances',[]) or []
+    mints=sorted({b.get('mint') for b in balances if b.get('mint')})
+    return {'signature':sig,'slot':tx.get('slot'),'block_time':tx.get('blockTime'),
+            'instruction_verified':bool(matched),'instruction_types':matched,
+            'token_mints_observed':mints,'account_count':len(accounts),
+            'classification':'pool_init_candidate_unverified' if not matched else 'pool_init_instruction_verified'}
+
+def decoder():
+    spacing=60/MAX_RPM; next_call=0
+    while True:
+        sig=QUEUE.get()
+        try:
+            remaining=next_call-time.monotonic()
+            if remaining>0:time.sleep(remaining)
+            next_call=time.monotonic()+spacing
+            tx=rpc(sig)
+            record=extract(sig,tx)
+            if record:
+                with LOCK:
+                    STATE['decoded']+=1; STATE['last_candidate']=record
+                    CANDIDATES.appendleft(record)
+                emit('candidate_decoded',**record)
+            else: emit('candidate_unavailable',signature=sig)
+        except (urllib.error.HTTPError,urllib.error.URLError,TimeoutError,RuntimeError,ValueError) as exc:
+            bump('rpc_errors'); emit('rpc_error',signature=sig,error=str(exc)[:180])
+            if isinstance(exc,urllib.error.HTTPError) and exc.code==429:
+                next_call=time.monotonic()+max(30,spacing*3)
+        except Exception as exc:
+            bump('rpc_errors'); emit('decode_error',signature=sig,error=str(exc)[:180])
+        finally:QUEUE.task_done()
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path not in ('/','/health'):
+        if self.path not in ('/','/health','/candidates'):
             self.send_error(404);return
-        with LOCK: payload = dict(STATE)
-        data = json.dumps(payload).encode()
-        self.send_response(200)
-        self.send_header('Content-Type','application/json')
-        self.send_header('Content-Length',str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-    def log_message(self,*args):pass
+        with LOCK:
+            data=dict(STATE); data['queue_depth']=QUEUE.qsize()
+            if self.path=='/candidates': data={'mode':'research_only','candidates':list(CANDIDATES)}
+        raw=json.dumps(data).encode()
+        self.send_response(200);self.send_header('Content-Type','application/json')
+        self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(raw)))
+        self.end_headers();self.wfile.write(raw)
+    def log_message(self,*args): pass
 
 if __name__=='__main__':
-    threading.Thread(target=listen,daemon=True).start()
+    emit('starting',program=PROGRAM,rpc_max_rpm=MAX_RPM,mode='research_only')
+    threading.Thread(target=stream,daemon=True).start()
+    threading.Thread(target=decoder,daemon=True).start()
     ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','10000'))),Handler).serve_forever()
