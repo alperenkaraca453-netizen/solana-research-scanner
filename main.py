@@ -1,5 +1,6 @@
 """Raydium AMM v4 pool-init research monitor. No orders, keys, or trading."""
 import collections, datetime, json, os, queue, threading, time, urllib.request, urllib.error
+from urllib.parse import urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from websocket import create_connection
 
@@ -124,19 +125,33 @@ def decoder():
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path not in ('/','/health','/candidates'):
-            self.send_error(404);return
+        path = urlsplit(self.path).path.rstrip('/') or '/'
         with LOCK:
-            data=dict(STATE); data['queue_depth']=QUEUE.qsize()
-            if self.path=='/candidates': data={'mode':'research_only','candidates':list(CANDIDATES)}
-        raw=json.dumps(data).encode()
-        self.send_response(200);self.send_header('Content-Type','application/json')
-        self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(raw)))
-        self.end_headers();self.wfile.write(raw)
+            data = dict(STATE)
+            data['queue_depth'] = QUEUE.qsize()
+            if path == '/candidates':
+                data = {'version':'v0.5','mode':'research_only','candidates':list(CANDIDATES)}
+            else:
+                data['version'] = 'v0.5'
+        if path not in ('/','/health','/candidates'):
+            data = {'version':'v0.5','error':'not_found','requested_path':path,
+                    'available_paths':['/','/health','/candidates']}
+            code = 404
+        else:
+            code = 200
+        raw=json.dumps(data,default=str).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type','application/json; charset=utf-8')
+        self.send_header('X-Scanner-Version','v0.5')
+        self.send_header('Cache-Control','no-store')
+        self.send_header('Content-Length',str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+        emit('http_request',path=path,status=code,version='v0.5')
     def log_message(self,*args): pass
 
 if __name__=='__main__':
-    emit('starting',program=PROGRAM,rpc_max_rpm=MAX_RPM,mode='research_only')
+    emit('starting',version='v0.5',program=PROGRAM,rpc_max_rpm=MAX_RPM,mode='research_only',port=int(os.getenv('PORT','10000')))
     threading.Thread(target=stream,daemon=True).start()
     threading.Thread(target=decoder,daemon=True).start()
     ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','10000'))),Handler).serve_forever()
