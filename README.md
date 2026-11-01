@@ -1,7 +1,9 @@
-# Solana Raydium scanner v0.6
+# Solana scanner v0.7 — instruction verification
 
-Research-only; no orders, wallet keys or trading.
+Research only, no trading. Corrects the v0.6 escaped regex bug.
 
-Fixes: separates failed Solana transactions from filtered successful ones; tracks initialization markers, duplicates and null RPC results; emits a 60-second heartbeat. `/health` exposes all counters; `/candidates` exposes decoded candidates. Zero candidates is not necessarily an error: it may mean no qualifying Raydium AMM v4 initialization occurred.
+Samples one in every SAMPLE_EVERY (default 250) successful notifications even without a matching log, then decodes Raydium AMM v4 instructions via getTransaction. Discriminator 1 is Initialize2.
 
-Upload `main.py` to the GitHub repository root, replacing the existing file. Render automatically deploys from main. Verify `/health` reports `version: v0.6`.
+`/health`: sampled, decoded, verified_inits, non_init_decoded, init_markers, rpc_errors. `/candidates`: **verified** AMM v4 pool-init instructions only.
+
+Default RPC_MAX_RPM=12, SAMPLE_EVERY=250. Monitoring only Raydium AMM v4; does not include CPMM, CLMM or PumpSwap.
