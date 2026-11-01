@@ -1,5 +1,5 @@
 """Raydium AMM v4 + CPMM pool creation monitor. Research only, never trades."""
-import collections, datetime, hashlib, json, os, queue, re, threading, time, urllib.request, urllib.error
+import collections, csv, datetime, hashlib, io, json, os, queue, re, threading, time, urllib.request, urllib.error
 from urllib.parse import urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from websocket import create_connection
@@ -18,7 +18,9 @@ STATE=dict(connected=False,connections={},last_event=None,last_error=None,events
            init_markers=0,candidates=0,verified_inits=0,decoded=0,non_init_decoded=0,
            sampled=0,rpc_errors=0,version_errors=0,rpc_null=0,dropped=0,
            duplicates=0,queue_depth=0,last_candidate=None,mode='research_only',live_trading=False)
-CANDIDATES=collections.deque(maxlen=50)
+CANDIDATES=collections.deque(maxlen=500)
+STARTED_AT=datetime.datetime.now(datetime.timezone.utc).isoformat()
+START_MONO=time.monotonic()
 SEEN=collections.deque(maxlen=5000)
 SEEN_SET=set()
 SEQ=0
@@ -128,7 +130,11 @@ def extract(sig,tx,kind):
             ins_accounts=ins.get('accounts') or []
             pool_accounts=[accounts[a] if isinstance(a,int) and a<len(accounts) else a for a in ins_accounts]
     mints=sorted({b.get('mint') for b in (tx.get('meta',{}).get('postTokenBalances') or []) if b.get('mint')})
+    # CPMM initialize instruction account indices 4/5/6 = pool authority / token0 mint / token1 mint.
+    # For AMM v4, leave pair unknown rather than guessing from transaction-wide balances.
+    pair=pool_accounts[5:7] if kind=='cpmm' and len(pool_accounts)>=7 and matches else []
     return {'signature':sig,'program':kind,'slot':tx.get('slot'),'block_time':tx.get('blockTime'),
+            'token_pair_mints':pair,'liquidity_usd':None,'risk_score':None,'paper_pnl_usd':None,
             'instruction_verified':bool(matches),'instruction_types':matches,
             'program_instruction_count':program_instruction_count,'discriminators':discriminators[:10],
             'token_mints_observed':mints,'instruction_accounts':pool_accounts[:30],
@@ -172,10 +178,20 @@ class Handler(BaseHTTPRequestHandler):
             data=dict(STATE)
             data['connections']=dict(STATE['connections']);data['events_by_program']=dict(STATE['events_by_program'])
             data['queue_depth']=QUEUE.qsize()
-            if path=='/candidates':data={'version':'v0.9','mode':'research_only','candidates':list(CANDIDATES)}
-            elif path=='/':data={'version':'v0.9','mode':'research_only','status':data,'endpoints':['/health','/candidates']}
-            else:data['version']='v0.9'
-        code=200 if path in ('/','/health','/candidates') else 404
+            data['started_at']=STARTED_AT
+            data['uptime_seconds']=round(time.monotonic()-START_MONO)
+            data['last_event_age_seconds']=round((datetime.datetime.now(datetime.timezone.utc)-datetime.datetime.fromisoformat(STATE['last_event'])).total_seconds()) if STATE['last_event'] else None
+            if path=='/candidates':data={'version':'v1.0','mode':'research_only','candidates':list(CANDIDATES)}
+            elif path=='/report':data={'version':'v1.0','generated_at':now(),'started_at':STARTED_AT,'uptime_seconds':round(time.monotonic()-START_MONO),'events':STATE['events'],'verified_pools':STATE['verified_inits'],'rpc_errors':STATE['rpc_errors'],'dropped':STATE['dropped'],'queue_depth':QUEUE.qsize(),'connections':dict(STATE['connections']),'last_event_age_seconds':data['last_event_age_seconds'],'paper_trades':0,'realized_pnl_usd':None,'note':'No price/liquidity source connected; profit cannot be calculated yet.'}
+            elif path=='/':data={'version':'v1.0','mode':'research_only','status':data,'endpoints':['/health','/candidates','/report','/export.csv']}
+            else:data['version']='v1.0'
+        if path=='/export.csv':
+            buf=io.StringIO();fields=['signature','program','slot','block_time','token_pair_mints','instruction_verified','liquidity_usd','risk_score','paper_pnl_usd']
+            writer=csv.DictWriter(buf,fieldnames=fields,extrasaction='ignore');writer.writeheader()
+            for item in list(CANDIDATES):
+                row=dict(item);row['token_pair_mints']=' | '.join(row.get('token_pair_mints',[]));writer.writerow(row)
+            raw=buf.getvalue().encode('utf-8');self.send_response(200);self.send_header('Content-Type','text/csv; charset=utf-8');self.send_header('Content-Disposition','attachment; filename=verified_pools.csv');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw);return
+        code=200 if path in ('/','/health','/candidates','/report') else 404
         if code==404:data={'error':'not_found','endpoints':['/','/health','/candidates']}
         raw=json.dumps(data,default=str).encode()
         self.send_response(code);self.send_header('Content-Type','application/json; charset=utf-8')
@@ -184,7 +200,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args):pass
 
 if __name__=='__main__':
-    emit('starting',version='v0.9',programs=PROGRAMS,rpc_max_rpm=MAX_RPM,sample_every=SAMPLE_EVERY,mode='research_only')
+    emit('starting',version='v1.0',programs=PROGRAMS,rpc_max_rpm=MAX_RPM,sample_every=SAMPLE_EVERY,mode='research_only')
     for kind,program in PROGRAMS.items():threading.Thread(target=stream,args=(kind,program),daemon=True).start()
     threading.Thread(target=decoder,daemon=True).start()
     threading.Thread(target=heartbeat,daemon=True).start()

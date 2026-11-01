@@ -1,14 +1,19 @@
-# Solana Raydium Pool Scanner v0.9
+# Solana Raydium Research Scanner v1.0
 
-Research-only. **No wallet, no orders, no live trading.**
+Research-only, **never sends orders**. Detects instruction-verified Raydium AMM v4 and CPMM pool initialization events.
 
-- Watches AMM v4 and CPMM program logs independently.
-- Prioritizes pool-initialization log markers, verifies the actual on-chain instruction (AMM v4 byte 1; CPMM Anchor `sha256("global:initialize")[:8]`).
-- Default `SAMPLE_EVERY=0`: does not waste RPC quota on arbitrary swaps. Set e.g. `SAMPLE_EVERY=1000` for diagnostic sampling.
-- RPC rate budget `RPC_MAX_RPM=12` shared across both programs.
-- `/health` reports independent connections and counters; `/candidates` contains only instruction-verified creations.
-- `token_mints_observed` is a set of mints seen in post-transaction token balances, **not necessarily an exact pool pair**. Confirm account mappings before trading.
+## Endpoints
+- `/health`: counters, connections, process uptime and last-event age
+- `/candidates`: verified candidates (in-memory, max 500)
+- `/report`: concise machine-readable test results; paper trades and P&L intentionally not fabricated
+- `/export.csv`: downloadable verified pool CSV with CPMM token-pair mint accounts
 
-Upload the four ZIP files into the root of the existing GitHub repository, replacing `main.py`. Render will deploy the latest commit if auto-deploy is enabled; otherwise deploy manually.
+## Limitations
+- Render free services may sleep; in-memory candidates and counters reset on restart.
+- `/export.csv` is a snapshot, not durable storage.
+- Liquidity, risk, and P&L remain null until separately verified market data and simulation are implemented.
+- Transaction-wide token balances are **not** assumed to be the trading pair.
+- No profit or safety claim is made.
 
-Note: logs-based detection can miss events without recognizable log markers; CPMM and AMM v4 only (not CLMM or LaunchLab). No performance/profit claim.
+## Deploy
+Upload all four files to GitHub repo root, replacing existing files. Render auto-deploys from main. Validate `/health`, `/report`, `/export.csv` after deployment.
