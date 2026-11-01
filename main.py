@@ -1,5 +1,5 @@
 """Raydium AMM v4 pool-init research monitor. No orders, keys, or trading."""
-import collections, datetime, json, os, queue, threading, time, urllib.request, urllib.error
+import collections, datetime, json, os, queue, threading, time, urllib.request, urllib.error, re
 from urllib.parse import urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from websocket import create_connection
@@ -12,6 +12,7 @@ QUEUE = queue.Queue(maxsize=250)
 LOCK = threading.Lock()
 STATE = dict(connected=False, subscription_id=None, last_event=None, last_error=None, events=0,
              candidates=0, decoded=0, rpc_errors=0, dropped=0, filtered=0,
+             failed_transactions=0, init_markers=0, duplicates=0, rpc_null=0,
              last_candidate=None, mode='research_only', live_trading=False)
 CANDIDATES = collections.deque(maxlen=30)
 SEEN = collections.deque(maxlen=1000)
@@ -24,19 +25,40 @@ def update(**kwargs):
 def bump(key):
     with LOCK: STATE[key] += 1
 
+# Anchor to Raydium's own program log, not arbitrary swap instructions.
+# Logs can contain "initialize2" or "initialize_2" depending on the program build.
+INIT_RE = re.compile(r"\\binitialize[_ ]?2\\b|\\binitializeinstruction2\\b", re.I)
+
 def enqueue(value):
     sig = value.get('signature')
-    if not sig or value.get('err') is not None: return
+    if not sig:
+        return
+    if value.get('err') is not None:
+        bump('failed_transactions')
+        return
     logs = value.get('logs') or []
-    # Raydium AMM v4 initializes a pool using initialize2. Only this pattern is
-    # queued for transaction verification; arbitrary swaps are NOT pool launches.
-    if not any('initialize2' in str(line).lower() or 'initialize_2' in str(line).lower() for line in logs):
-        bump('filtered'); return
-    if sig in SEEN_SET: return
-    if len(SEEN) == SEEN.maxlen: SEEN_SET.discard(SEEN.popleft())
-    SEEN.append(sig); SEEN_SET.add(sig)
-    try: QUEUE.put_nowait(sig); bump('candidates'); emit('candidate_queued', signature=sig)
-    except queue.Full: bump('dropped'); emit('queue_full', signature=sig)
+    # A candidate must contain an initialization marker. We do not call it a
+    # new pool until its transaction and program instruction are verified.
+    marker = any(INIT_RE.search(str(line)) for line in logs)
+    if not marker:
+        bump('filtered')
+        return
+    bump('init_markers')
+    with LOCK:
+        if sig in SEEN_SET:
+            STATE['duplicates'] += 1
+            return
+        if len(SEEN) == SEEN.maxlen:
+            SEEN_SET.discard(SEEN.popleft())
+        SEEN.append(sig)
+        SEEN_SET.add(sig)
+    try:
+        QUEUE.put_nowait(sig)
+        bump('candidates')
+        emit('candidate_queued', signature=sig)
+    except queue.Full:
+        bump('dropped')
+        emit('queue_full', signature=sig)
 
 def stream():
     delay=2
@@ -99,6 +121,13 @@ def extract(sig,tx):
             'token_mints_observed':mints,'account_count':len(accounts),
             'classification':'pool_init_candidate_unverified' if not matched else 'pool_init_instruction_verified'}
 
+def heartbeat():
+    while True:
+        time.sleep(60)
+        with LOCK:
+            snapshot = {k:STATE[k] for k in ('connected','events','failed_transactions','filtered','init_markers','candidates','decoded','rpc_errors','rpc_null','dropped')}
+        emit('heartbeat',**snapshot)
+
 def decoder():
     spacing=60/MAX_RPM; next_call=0
     while True:
@@ -114,7 +143,9 @@ def decoder():
                     STATE['decoded']+=1; STATE['last_candidate']=record
                     CANDIDATES.appendleft(record)
                 emit('candidate_decoded',**record)
-            else: emit('candidate_unavailable',signature=sig)
+            else:
+                bump('rpc_null')
+                emit('candidate_unavailable',signature=sig)
         except (urllib.error.HTTPError,urllib.error.URLError,TimeoutError,RuntimeError,ValueError) as exc:
             bump('rpc_errors'); emit('rpc_error',signature=sig,error=str(exc)[:180])
             if isinstance(exc,urllib.error.HTTPError) and exc.code==429:
@@ -130,11 +161,11 @@ class Handler(BaseHTTPRequestHandler):
             data = dict(STATE)
             data['queue_depth'] = QUEUE.qsize()
             if path == '/candidates':
-                data = {'version':'v0.5','mode':'research_only','candidates':list(CANDIDATES)}
+                data = {'version':'v0.6','mode':'research_only','candidates':list(CANDIDATES)}
             else:
-                data['version'] = 'v0.5'
+                data['version'] = 'v0.6'
         if path not in ('/','/health','/candidates'):
-            data = {'version':'v0.5','error':'not_found','requested_path':path,
+            data = {'version':'v0.6','error':'not_found','requested_path':path,
                     'available_paths':['/','/health','/candidates']}
             code = 404
         else:
@@ -142,16 +173,17 @@ class Handler(BaseHTTPRequestHandler):
         raw=json.dumps(data,default=str).encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type','application/json; charset=utf-8')
-        self.send_header('X-Scanner-Version','v0.5')
+        self.send_header('X-Scanner-Version','v0.6')
         self.send_header('Cache-Control','no-store')
         self.send_header('Content-Length',str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
-        emit('http_request',path=path,status=code,version='v0.5')
+        emit('http_request',path=path,status=code,version='v0.6')
     def log_message(self,*args): pass
 
 if __name__=='__main__':
-    emit('starting',version='v0.5',program=PROGRAM,rpc_max_rpm=MAX_RPM,mode='research_only',port=int(os.getenv('PORT','10000')))
+    emit('starting',version='v0.6',program=PROGRAM,rpc_max_rpm=MAX_RPM,mode='research_only',port=int(os.getenv('PORT','10000')))
     threading.Thread(target=stream,daemon=True).start()
     threading.Thread(target=decoder,daemon=True).start()
+    threading.Thread(target=heartbeat,daemon=True).start()
     ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','10000'))),Handler).serve_forever()
