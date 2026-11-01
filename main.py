@@ -1,46 +1,65 @@
-import os,time,json,sqlite3,urllib.request,datetime
-DB=os.getenv('DB_PATH','scanner.db')
-INTERVAL=max(60,int(os.getenv('POLL_SECONDS','120')))
-MIN_LIQ=float(os.getenv('MIN_LIQ_USD','50000'))
-MIN_VOL=float(os.getenv('MIN_VOL_H1_USD','20000'))
-URL='https://api.dexscreener.com/token-profiles/latest/v1'
+"""Solana event stream monitor: research only, never submits transactions."""
+import json, os, threading, time, datetime, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from websocket import create_connection, WebSocketTimeoutException
 
-def fetch(url):
-    req=urllib.request.Request(url,headers={'User-Agent':'SolanaResearchScanner/0.1'})
-    with urllib.request.urlopen(req,timeout=20) as r:return json.load(r)
+RPC_WS = os.getenv('SOLANA_WS_URL', 'wss://api.mainnet-beta.solana.com/')
+# Raydium AMM v4; logs are transaction events, NOT verified pool launches.
+PROGRAM = os.getenv('SOLANA_PROGRAM_ID', '675kPX9MHTjS2zt1qfr1NYHuze1uFQd1f4Gd5Kp9a')
+STATE = {'connected': False, 'last_event': None, 'events': 0, 'last_error': None, 'mode': 'research_only'}
+LOCK = threading.Lock()
 
-def init(db):
-    db.execute('CREATE TABLE IF NOT EXISTS observations(ts TEXT, token TEXT, symbol TEXT, pair TEXT, price REAL, liquidity REAL, volume_h1 REAL, change_h1 REAL, PRIMARY KEY(ts,pair))')
-    db.commit()
+def utc():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-def scan(db):
-    profiles=fetch(URL)
-    addresses=list(dict.fromkeys(p.get('tokenAddress') for p in profiles if p.get('chainId')=='solana' and p.get('tokenAddress')))[:25]
-    now=datetime.datetime.now(datetime.timezone.utc).isoformat()
-    hits=[]
-    for address in addresses:
+def listen():
+    retry = 2
+    while True:
+        ws = None
         try:
-            data=fetch('https://api.dexscreener.com/token-pairs/v1/solana/'+address)
-            if not isinstance(data,list):continue
-            for p in data:
-                liq=float((p.get('liquidity') or {}).get('usd') or 0)
-                vol=float((p.get('volume') or {}).get('h1') or 0)
-                if liq<MIN_LIQ or vol<MIN_VOL:continue
-                price=float(p.get('priceUsd') or 0)
-                if price<=0:continue
-                change=float((p.get('priceChange') or {}).get('h1') or 0)
-                symbol=(p.get('baseToken') or {}).get('symbol','?')
-                pair=p.get('pairAddress','')
-                db.execute('INSERT OR IGNORE INTO observations VALUES (?,?,?,?,?,?,?,?)',(now,address,symbol,pair,price,liq,vol,change))
-                hits.append({'token':symbol,'pair':pair,'price_usd':price,'liquidity_usd':liq,'volume_h1_usd':vol,'change_h1_pct':change})
-        except Exception as e:print('pair_error',address,str(e),flush=True)
-    db.commit()
-    print(json.dumps({'time':now,'qualified_observations':len(hits),'results':hits},ensure_ascii=False),flush=True)
+            ws = create_connection(RPC_WS, timeout=30)
+            ws.settimeout(45)
+            ws.send(json.dumps({'jsonrpc':'2.0','id':1,'method':'logsSubscribe','params':[{'mentions':[PROGRAM]},{'commitment':'confirmed'}]}))
+            ack = json.loads(ws.recv())
+            if 'result' not in ack:
+                raise RuntimeError(f'subscription rejected: {str(ack)[:350]}')
+            with LOCK:
+                STATE.update(connected=True, last_error=None)
+            retry = 2
+            while True:
+                msg = json.loads(ws.recv())
+                if msg.get('method') != 'logsNotification':
+                    continue
+                value = msg.get('params',{}).get('result',{}).get('value',{})
+                with LOCK:
+                    STATE['events'] += 1
+                    STATE['last_event'] = utc()
+                # Emit signature only. No false claim that every event is a new token.
+                print(json.dumps({'ts':utc(),'event':'program_transaction','signature':value.get('signature'),'err':value.get('err')}),flush=True)
+        except Exception as exc:
+            with LOCK:
+                STATE.update(connected=False,last_error=str(exc))
+            print('stream_error',str(exc),flush=True)
+            time.sleep(retry)
+            retry = min(60,retry*2)
+        finally:
+            if ws:
+                try: ws.close()
+                except Exception: pass
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ('/','/health'):
+            self.send_error(404);return
+        with LOCK: payload = dict(STATE)
+        data = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header('Content-Type','application/json')
+        self.send_header('Content-Length',str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    def log_message(self,*args):pass
 
 if __name__=='__main__':
-    db=sqlite3.connect(DB);init(db)
-    print('RESEARCH ONLY. No real orders. No demonstrated profitability.',flush=True)
-    while True:
-        try:scan(db)
-        except Exception as e:print('scan_error',str(e),flush=True)
-        time.sleep(INTERVAL)
+    threading.Thread(target=listen,daemon=True).start()
+    ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','10000'))),Handler).serve_forever()
