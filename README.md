@@ -1,19 +1,24 @@
-# Solana Raydium Research Scanner v1.0
+# Solana Research Scanner v1.1 — read-only market measurement
 
-Research-only, **never sends orders**. Detects instruction-verified Raydium AMM v4 and CPMM pool initialization events.
+Keeps v1.0 Raydium AMM v4 / CPMM detection and adds `/analytics` with third-party price and liquidity sampling for **instruction-verified** CPMM pools. The scanner never trades.
 
 ## Endpoints
-- `/health`: counters, connections, process uptime and last-event age
-- `/candidates`: verified candidates (in-memory, max 500)
-- `/report`: concise machine-readable test results; paper trades and P&L intentionally not fabricated
-- `/export.csv`: downloadable verified pool CSV with CPMM token-pair mint accounts
+- `/health`: status and connections
+- `/candidates`: verified pool initialization transactions
+- `/analytics`: first observed and latest market price, liquidity in USD when provided, 5/15/60-minute price change, illustrative return with assumed costs
+- `/report`: counters and analytics totals
+- `/export.csv`: verified pool list (original v1.0 export)
 
-## Limitations
-- Render free services may sleep; in-memory candidates and counters reset on restart.
-- `/export.csv` is a snapshot, not durable storage.
-- Liquidity, risk, and P&L remain null until separately verified market data and simulation are implemented.
-- Transaction-wide token balances are **not** assumed to be the trading pair.
-- No profit or safety claim is made.
+## Important limitations
+- DexScreener may not index a newly created pool immediately. A pool can remain `pool_not_indexed`; missing price is **not zero**.
+- Price tracking begins when a market price is **first observed**, not at pool creation. 5/15/60-minute checkpoints are elapsed since that observation and can be late due to polling.
+- `illustrative_net_pct = observed price change % - PAPER_TOTAL_COST_BPS / 100`. Default 100 bps (1%) round trip is a user-configurable assumption, **not an executable trading PnL**, and ignores actual fill prices, variable slippage, MEV, and taxes.
+- Risk/security checks are **not implemented**. The `/analytics` `safety` field reports `not_checked`; it must never be treated as a passing risk score.
+- `/tmp/solana_analytics.jsonl` and in-memory data are **ephemeral** on Render Free; they may disappear after sleep/restart/deploy. Add persistent storage before relying on historical results.
+- WebSocket 1006 errors and missed messages remain possible on public Solana RPC.
+- Only CPMM pool addresses are mapped for market matching. AMM v4 initialization events remain available in `/candidates`, but price tracking may be unsupported.
 
 ## Deploy
-Upload all four files to GitHub repo root, replacing existing files. Render auto-deploys from main. Validate `/health`, `/report`, `/export.csv` after deployment.
+Upload `main.py`, `analytics.py`, `Dockerfile`, `requirements.txt` and `README.md` to repository root. Render's Dockerfile uses `COPY . .` to include `analytics.py`. Do not upload a nested folder.
+
+Optional env: `PRICE_POLL_SECONDS=60`, `PAPER_TOTAL_COST_BPS=100`, `MAX_TRACKED_POOLS=30`, `ANALYTICS_JSONL=/tmp/solana_analytics.jsonl`.

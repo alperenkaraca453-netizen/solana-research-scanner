@@ -3,6 +3,7 @@ import collections, csv, datetime, hashlib, io, json, os, queue, re, threading, 
 from urllib.parse import urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from websocket import create_connection
+import analytics
 
 PROGRAMS = {'amm_v4':'675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
             'cpmm':'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C'}
@@ -154,6 +155,7 @@ def decoder():
                     STATE['decoded']+=1
                     if record['instruction_verified']:
                         STATE['verified_inits']+=1;STATE['last_candidate']=record;CANDIDATES.appendleft(record)
+                        analytics.add_pool(record)
                     else:STATE['non_init_decoded']+=1
                 emit('transaction_decoded',**record)
             else:bump('rpc_null');emit('transaction_unavailable',signature=sig,program=kind)
@@ -181,9 +183,10 @@ class Handler(BaseHTTPRequestHandler):
             data['started_at']=STARTED_AT
             data['uptime_seconds']=round(time.monotonic()-START_MONO)
             data['last_event_age_seconds']=round((datetime.datetime.now(datetime.timezone.utc)-datetime.datetime.fromisoformat(STATE['last_event'])).total_seconds()) if STATE['last_event'] else None
-            if path=='/candidates':data={'version':'v1.0','mode':'research_only','candidates':list(CANDIDATES)}
-            elif path=='/report':data={'version':'v1.0','generated_at':now(),'started_at':STARTED_AT,'uptime_seconds':round(time.monotonic()-START_MONO),'events':STATE['events'],'verified_pools':STATE['verified_inits'],'rpc_errors':STATE['rpc_errors'],'dropped':STATE['dropped'],'queue_depth':QUEUE.qsize(),'connections':dict(STATE['connections']),'last_event_age_seconds':data['last_event_age_seconds'],'paper_trades':0,'realized_pnl_usd':None,'note':'No price/liquidity source connected; profit cannot be calculated yet.'}
-            elif path=='/':data={'version':'v1.0','mode':'research_only','status':data,'endpoints':['/health','/candidates','/report','/export.csv']}
+            if path=='/analytics':data=analytics.snapshot()
+            elif path=='/candidates':data={'version':'v1.1','mode':'research_only','candidates':list(CANDIDATES)}
+            elif path=='/report':data={'version':'v1.1','generated_at':now(),'started_at':STARTED_AT,'uptime_seconds':round(time.monotonic()-START_MONO),'events':STATE['events'],'verified_pools':STATE['verified_inits'],'rpc_errors':STATE['rpc_errors'],'dropped':STATE['dropped'],'queue_depth':QUEUE.qsize(),'connections':dict(STATE['connections']),'last_event_age_seconds':data['last_event_age_seconds'],'paper_trades':0,'analytics':analytics.snapshot()['stats'],'realized_pnl_usd':None,'note':'No price/liquidity source connected; profit cannot be calculated yet.'}
+            elif path=='/':data={'version':'v1.1','mode':'research_only','status':data,'endpoints':['/health','/candidates','/report','/analytics','/export.csv']}
             else:data['version']='v1.0'
         if path=='/export.csv':
             buf=io.StringIO();fields=['signature','program','slot','block_time','token_pair_mints','instruction_verified','liquidity_usd','risk_score','paper_pnl_usd']
@@ -191,7 +194,7 @@ class Handler(BaseHTTPRequestHandler):
             for item in list(CANDIDATES):
                 row=dict(item);row['token_pair_mints']=' | '.join(row.get('token_pair_mints',[]));writer.writerow(row)
             raw=buf.getvalue().encode('utf-8');self.send_response(200);self.send_header('Content-Type','text/csv; charset=utf-8');self.send_header('Content-Disposition','attachment; filename=verified_pools.csv');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw);return
-        code=200 if path in ('/','/health','/candidates','/report') else 404
+        code=200 if path in ('/','/health','/candidates','/report','/analytics') else 404
         if code==404:data={'error':'not_found','endpoints':['/','/health','/candidates']}
         raw=json.dumps(data,default=str).encode()
         self.send_response(code);self.send_header('Content-Type','application/json; charset=utf-8')
@@ -200,8 +203,9 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args):pass
 
 if __name__=='__main__':
-    emit('starting',version='v1.0',programs=PROGRAMS,rpc_max_rpm=MAX_RPM,sample_every=SAMPLE_EVERY,mode='research_only')
+    emit('starting',version='v1.1',programs=PROGRAMS,rpc_max_rpm=MAX_RPM,sample_every=SAMPLE_EVERY,mode='research_only')
     for kind,program in PROGRAMS.items():threading.Thread(target=stream,args=(kind,program),daemon=True).start()
     threading.Thread(target=decoder,daemon=True).start()
     threading.Thread(target=heartbeat,daemon=True).start()
+    threading.Thread(target=analytics.worker,daemon=True).start()
     ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','10000'))),Handler).serve_forever()
